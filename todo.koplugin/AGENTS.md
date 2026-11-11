@@ -36,6 +36,14 @@ next sync.
   `keepOrder` puts the agenda, Starred and list sections through `PS.stable.order`. The web page does the
   same for one draw after Done, star, Skip or a dialog that only changed the date, name or notes
   (`keepNext` in web/todo.js).
+- `todocaldav.lua`: the calendar's events from a CalDAV server, shown on the calendar (read only).
+  Plain Lua with no KOReader modules (the network and settings are passed in, as `todoapi` does): a
+  GET of the calendar's address first, a `REPORT calendar-query` in a window when that is no calendar;
+  a hand-rolled iCal parse (SUMMARY, DTSTART, DTEND or DURATION, LOCATION, DESCRIPTION, basic RRULE).
+  Fetched events live in `todo_caldav.lua` (`data.events`), shown when `caldav_show` is on
+  (`Todo:caldavEvents`, fetched again in a child process by `Todo:syncEvents`, from the ⟳ on the
+  calendar and the settings' **Calendar events (CalDAV)** menu). Settings keys `caldav_url`,
+  `caldav_calendar`, `caldav_user`, `caldav_pass`.
 - `todoko.lua`: a copy of `apps.koplugin/appsko.lua` with its own header. Keep it in step.
 
 What it saves:

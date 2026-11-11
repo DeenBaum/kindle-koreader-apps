@@ -148,7 +148,7 @@ The same works when you rename a task: **Rename and set date** or **Keep as type
 - **Today**: what's overdue and what's due today.
 - **Agenda**: overdue, today, then each of the next 6 days, by reminder time.
 - **Starred**: starred tasks from every list.
-- **Calendar**: the month, with a dot for each task due that day (a hollow dot is overdue). Repeating tasks show on the days they will fall on; tasks that repeat every day or two are listed once instead. Tap a day for its tasks; hold a day to add a task due then. Swipe or use the arrows for other months.
+- **Calendar**: the month, with a dot for each task due that day (a hollow dot is overdue). Repeating tasks show on the days they will fall on; tasks that repeat every day or two are listed once instead. Tap a day for its tasks; hold a day to add a task due then. Swipe or use the arrows for other months. Events from a calendar server (CalDAV) show after the tasks of their day, if set up (Settings > **Calendar events (CalDAV)**). The ⟳ at the top fetches the server's events again; tap an event for its details (read only, nothing is sent back).
 - **Search**: titles, notes and steps in every list, including done tasks.
 
 ## Split view
@@ -210,6 +210,12 @@ Done tasks, tasks hidden on sleep and hidden lists are left out.
 - **Lists on this Kindle**: on to start with; off hides them (see "Lists on this Kindle").
 
 - **Reminder alerts**: reminders pop up on the Kindle while KOReader is open, with **Snooze**, **Open** and **Done**. **Snooze** brings it back in 15 or 30 minutes, 1 or 3 hours, tomorrow at 9 AM, or **Custom…** (type a number, then **Minutes**, **Hours** or **Days**), on the Kindle only (To Do's reminder on your phone stays as it was). A reminder you don't answer stays in Notifications. Ones missed in the last two hours (while asleep) show when it wakes.
+
+### Calendar events (CalDAV)
+
+- **Calendar events (CalDAV)**: shows the events of a calendar server on the Calendar view, next to the tasks. Tap it to set the **Server URL** (for example `https://example.com/dav`), the **Calendar URL** (an address to the calendar or its .ics file; a path is taken on the server's address), a **Username** and a **Password** (Basic sign-in; leave the name empty for a calendar anyone may read), and **Show on the calendar** on or off. The same menu opens with Sync now and Forget, which clears the settings and the events kept.
+- The events are fetched read only: nothing is written back to the server. ⟳ on the Calendar view fetches again; a day's events show after its tasks, an all-day one first, and repeating events (daily, weekly or monthly) on the days they fall on. What was fetched stays on the Kindle, so the calendar shows events without Wi-Fi.
+- The server is asked when **Test connection** runs too, as **Calendar (CalDAV)**.
 
 ### Sync, sleep screen and account
 

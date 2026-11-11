@@ -35,6 +35,7 @@ local ffiutil = require("ffi/util")
 local Screen = Device.screen
 
 local Api = require("todoapi")
+local Cal = require("todocaldav")
 local Dates = require("tododates")
 local Model = require("todomodel")
 local Store = require("todostore")
@@ -66,6 +67,7 @@ local DEFAULTS = {
     two_panes = true,            -- on its side: the lists at the left, the open one at the right
     local_lists = true,          -- lists kept only on this Kindle (off: hidden, still kept)
     stable_lists = true,         -- Keep rows in place: a ticked, starred or moved task stays where it is
+    caldav_show = true,          -- the calendar's events (CalDAV) on the calendar, once set up
 }
 
 -- The launcher's stable lists (PS.stable); without the launcher, lists sort every time.
@@ -110,6 +112,10 @@ function Todo:init()
         request = httpRequest,
         json = require("json"),
     }
+    self.caldav = Cal.new{ settings = settings, request = httpRequest }
+    -- The calendar's events (CalDAV), as last fetched (todo_caldav.lua).
+    self.caldavFile = LuaSettings:open(DataStorage:getSettingsDir() .. "/todo_caldav.lua")
+    self.caldavEvents = self.caldavFile:readSetting("data", {}).events or {}
     self:useMicrosoftAccount()
     self:openStore()
     -- The clock: KOReader's own setting, the same in every app.
@@ -214,23 +220,37 @@ function Todo:shareWithApps()
         end }
     end
     if PS.registerTest then
-        -- Test connection (appstest.lua): Microsoft's sign-in, then To Do itself. Only once
-        -- there's an App ID (lists on this Kindle alone connect to nothing).
+        -- Test connection (appstest.lua): Microsoft's sign-in, then To Do itself, and the
+        -- calendar's server (CalDAV) when it's set up. Lists on this Kindle alone connect to
+        -- nothing (but a calendar set up does).
         PS.registerTest{ key = "todo", name = _("To Do"),
-            configured = function() local t = Todo.instance return t ~= nil and (t.api.clientId ~= nil or t.api:signedIn()) end,
+            configured = function() local t = Todo.instance
+                return t ~= nil and (t.api.clientId ~= nil or t.api:signedIn() or (t.caldav and t.caldav:configured())) end,
             run = function(Test)
             local t = Todo.instance
-            if not (t and (t.api.clientId or t.api:signedIn())) then return {} end
+            local microsoft = t and (t.api.clientId or t.api:signedIn())
+            if not (t and (microsoft or (t.caldav and t.caldav:configured()))) then return {} end
             -- (In the test's child: a token it gets isn't kept, the next sync gets its own.)
             t.api.settings.save = function() end
             local PS2 = require("pluginshare")
             if t.api.account and PS2.microsoft.store then PS2.microsoft.store().save = function() end end
             local out = {}
-            for __, r in ipairs(t.api:testConnection(require("socket").gettime)) do
-                if not (r.name == "signin" and t.api.account) then
-                table.insert(out, { name = r.name == "signin" and _("Microsoft sign-in") or _("Microsoft To Do"), detail = r.detail,
-                    ok = r.ok, ms = r.ms, raw = r.err and r.err ~= "nil" and tostring(r.err) or nil, why = r.kind == "signin" and _("Your sign-in has run out. Sign in again.")
-                        or r.kind == "unreachable" and Test.why(r.err) or r.err })
+            if microsoft then
+                for __, r in ipairs(t.api:testConnection(require("socket").gettime)) do
+                    if not (r.name == "signin" and t.api.account) then
+                    table.insert(out, { name = r.name == "signin" and _("Microsoft sign-in") or _("Microsoft To Do"), detail = r.detail,
+                        ok = r.ok, ms = r.ms, raw = r.err and r.err ~= "nil" and tostring(r.err) or nil, why = r.kind == "signin" and _("Your sign-in has run out. Sign in again.")
+                            or r.kind == "unreachable" and Test.why(r.err) or r.err })
+                    end
+                end
+            end
+            -- The calendar's server (CalDAV): its events, in the window the calendar keeps.
+            if t.caldav and t.caldav:configured() then
+                for __, r in ipairs(t.caldav:testConnection(require("socket").gettime,
+                        (t:today() - Cal.BEFORE) * 86400, (t:today() + Cal.AFTER) * 86400)) do
+                    table.insert(out, { name = _("Calendar (CalDAV)"), detail = r.detail, ok = r.ok, ms = r.ms,
+                        raw = r.err and r.err ~= "nil" and tostring(r.err) or nil,
+                        why = r.kind == "unreachable" and Test.why(r.err) or r.err })
                 end
             end
             return out
@@ -1995,6 +2015,150 @@ function Todo:onNetworkConnected()
             if self:connected() then self:runSync({ downloadOnly = self:opt("download_only") }, true) end
         end)
     end
+end
+
+-- ------------------------------------------------------------------ calendar events (CalDAV)
+
+--- The calendar's events (from CalDAV) for the calendar view, when set up and
+-- not turned off; nil otherwise.
+function Todo:caldavEvents()
+    if self:opt("caldav_show") and self.caldav:configured() then return self.caldavEvents end
+    return nil
+end
+
+--- A CalDAV setting kept (empty: taken out).
+function Todo:saveCaldav(key, value)
+    if value and value ~= "" then self.settings:saveSetting(key, value) else self.settings:delSetting(key) end
+    self.settings:flush()
+    self:render()
+end
+
+--- The calendar's menu (Settings > Calendar events, or ⟳ on the calendar when
+-- nothing is set up): the server, its calendar, the sign-in, show or hide.
+function Todo:calendarMenu()
+    local cal = self.caldav
+    choose(_("Calendar events (CalDAV)"), {
+        { text = _("Sync now"), fn = function() self:syncEvents() end },
+        { text = _("Server URL"), fn = function()
+            input(_("Server URL"), cal:get("caldav_url"), function(v) self:saveCaldav("caldav_url", v) end, { write = false })
+        end },
+        { text = _("Calendar URL"), fn = function()
+            input(_("Calendar URL (the .ics file, or the calendar's address)"), cal:get("caldav_calendar"),
+                function(v) self:saveCaldav("caldav_calendar", v) end, { write = false })
+        end },
+        { text = _("Username"), fn = function()
+            input(_("Username"), cal:get("caldav_user"), function(v) self:saveCaldav("caldav_user", v) end, { write = false })
+        end },
+        { text = _("Password"), fn = function()
+            input(_("Password"), cal:get("caldav_pass"), function(v) self:saveCaldav("caldav_pass", v) end, { write = false })
+        end },
+        { text = self:opt("caldav_show") and _("Show on the calendar: on") or _("Show on the calendar: off"),
+            fn = function() self:flip("caldav_show") end },
+        cal:configured() and { text = _("Remove calendar"), fn = function()
+            confirm(_("Remove the calendar and its events from this Kindle?"), _("Remove"), function()
+                for __, key in ipairs({ "caldav_url", "caldav_calendar", "caldav_user", "caldav_pass" }) do
+                    self.settings:delSetting(key)
+                end
+                self.settings:flush()
+                self.caldavEvents = {}
+                self.caldavFile:delSetting("data")
+                self.caldavFile:flush()
+                local PS = require("pluginshare")
+                if PS.unnotify then pcall(PS.unnotify, "todo:caldav") end
+                self:render()
+            end)
+        end } or nil,
+    })
+end
+
+--- The calendar's events from the CalDAV server, in a child process (the
+-- request can wait on the network; the screen keeps answering). Only synced
+-- when you ask: the ⟳ on the calendar, or **Sync now** in its menu.
+function Todo:syncEvents()
+    if not self.caldav:configured() then return self:calendarMenu() end
+    NetworkMgr:runWhenOnline(function()
+        local waitBox = require("todoko").wait(_("Fetching the calendar…"))
+        local cal = self.caldav
+        local offset = self:offset()
+        local today = self:today()
+        local from, until_ = (today - Cal.BEFORE) * 86400, (today + Cal.AFTER) * 86400
+        local pid, fd = ffiutil.runInSubProcess(function(_, write_fd)
+            local events, why = cal:fetch(from, until_, offset)
+            ffiutil.writeToFD(write_fd, require("dump")({ events = events, why = why }), true)
+        end, true)
+        if not pid then
+            waitBox:close()
+            return self:caldavFailed(tostring(fd))
+        end
+        local deadline = os.time() + 120
+        local function reap() if not ffiutil.isSubProcessDone(pid) then UIManager:scheduleIn(1, reap) end end
+        local function check()
+            local size = ffiutil.getNonBlockingReadSize(fd)
+            local exited = ffiutil.isSubProcessDone(pid)
+            if not (size and size > 0) and not exited then
+                if os.time() < deadline then return UIManager:scheduleIn(0.3, check) end
+                -- Stuck (a server that never answers): stopped; what's shown stays.
+                ffiutil.terminateSubProcess(pid)
+                reap()
+                waitBox:close()
+                return self:caldavFailed(_("The calendar server took too long to answer"))
+            end
+            local raw = (size and size > 0) and ffiutil.readAllFromFD(fd) or ""
+            if not exited then reap() end
+            local fn = raw ~= "" and loadstring("return " .. raw)
+            local ok, out = pcall(fn or error)
+            waitBox:close()
+            if ok and type(out) == "table" then
+                self:caldavFetched(out.events, out.why)
+            else
+                self:caldavFailed(_("Could not read the answer"))
+            end
+        end
+        UIManager:scheduleIn(0.3, check)
+    end)
+end
+
+--- The events the child fetched: kept (todo_caldav.lua), the screen drawn again.
+function Todo:caldavFetched(events, why)
+    if not events then return self:caldavFailed(why) end
+    self.caldavEvents = events
+    self.caldavFile:saveSetting("data", { events = events, syncedAt = os.time() })
+    self.caldavFile:flush()
+    local PS = require("pluginshare")
+    if PS.unnotify then pcall(PS.unnotify, "todo:caldav") end
+    notify(#events == 0 and _("Calendar: no events") or T(_("Calendar: %1 events"), #events))
+    self:sortAgain()
+    self:render()
+end
+
+--- A calendar fetch that didn't come off: what's shown stays, a note waits in
+-- the notifications until a fetch succeeds.
+function Todo:caldavFailed(why)
+    logger.warn("To Do calendar:", why)
+    self:notify(T(_("Could not fetch the calendar: %1"), tostring(why)), "todo:caldav")
+    require("todoko").message(T(_("Could not fetch the calendar:\n%1"), tostring(why)))
+    self:render()
+end
+
+--- A calendar event's details (read only).
+function Todo:showEvent(ev, day, minute)
+    local lines
+    if ev.allDay then
+        lines = ev.days and ev.days > 1 and Dates.long(day) .. " \u{2013} " .. Dates.long(day + ev.days - 1) or Dates.long(day)
+    else
+        lines = Dates.long(day) .. "  \u{00B7}  " .. Dates.clock(minute)
+        if ev.ends then
+            local offset = self:offset()
+            if math.floor((ev.ends + offset) / 86400) == day then
+                lines = lines .. " \u{2013} " .. Dates.clock(math.floor((ev.ends + offset) % 86400 / 60))
+            end
+        end
+    end
+    if ev.location and ev.location ~= "" then lines = lines .. "\n" .. ev.location end
+    if ev.notes and ev.notes ~= "" then lines = lines .. "\n\n" .. ev.notes end
+    local P = require("pluginshare").popup
+    if P and P.read then return P.read{ title = ev.title, text = lines } end
+    require("todoko").message(ev.title .. "\n\n" .. lines)
 end
 
 --- Downloads To Do's copy and counts what differs from the reader's last
