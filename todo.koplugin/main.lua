@@ -120,7 +120,7 @@ function Todo:init()
     self.caldavRaw = calData.events or {}
     self.caldavQueue = calData.queue or {}
     self.caldavQseq = calData.qseq or 0
-    self.caldavEvents = Cal.applyQueue(self.caldavRaw, self.caldavQueue)
+    self.caldavList = Cal.applyQueue(self.caldavRaw, self.caldavQueue)
     self:useMicrosoftAccount()
     self:openStore()
     -- The clock: KOReader's own setting, the same in every app.
@@ -2027,7 +2027,7 @@ end
 --- The calendar's events (from CalDAV) for the calendar view, when set up and
 -- not turned off; nil otherwise.
 function Todo:caldavEvents()
-    if self:opt("caldav_show") and self.caldav:configured() then return self.caldavEvents end
+    if self:opt("caldav_show") and self.caldav:configured() then return self.caldavList end
     return nil
 end
 
@@ -2042,7 +2042,7 @@ end
 -- waiting to be sent, and what the screens show (the fetched ones with the
 -- queue's changes on top).
 function Todo:saveCaldavData()
-    self.caldavEvents = Cal.applyQueue(self.caldavRaw, self.caldavQueue)
+    self.caldavList = Cal.applyQueue(self.caldavRaw, self.caldavQueue)
     self.caldavFile:saveSetting("data", { events = self.caldavRaw, queue = self.caldavQueue,
         qseq = self.caldavQseq, syncedAt = self.caldavSyncedAt })
     self.caldavFile:flush()
@@ -2104,7 +2104,7 @@ function Todo:calendarMenu()
                     self.settings:delSetting(key)
                 end
                 self.settings:flush()
-                self.caldavRaw, self.caldavQueue, self.caldavEvents = {}, {}, {}
+                self.caldavRaw, self.caldavQueue, self.caldavList = {}, {}, {}
                 self.caldavFile:delSetting("data")
                 self.caldavFile:flush()
                 local PS = require("pluginshare")
