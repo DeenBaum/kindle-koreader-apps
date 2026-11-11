@@ -36,19 +36,31 @@ next sync.
   `keepOrder` puts the agenda, Starred and list sections through `PS.stable.order`. The web page does the
   same for one draw after Done, star, Skip or a dialog that only changed the date, name or notes
   (`keepNext` in web/todo.js).
-- `todocaldav.lua`: the calendar's events from a CalDAV server, shown on the calendar (read only).
+- `todocaldav.lua`: the calendar's events from a CalDAV server, shown on the calendar and editable.
   Plain Lua with no KOReader modules (the network and settings are passed in, as `todoapi` does): a
   GET of the calendar's address first, a `REPORT calendar-query` in a window when that is no calendar;
-  a hand-rolled iCal parse (SUMMARY, DTSTART, DTEND or DURATION, LOCATION, DESCRIPTION, basic RRULE).
-  Fetched events live in `todo_caldav.lua` (`data.events`), shown when `caldav_show` is on
-  (`Todo:caldavEvents`, fetched again in a child process by `Todo:syncEvents`, from the ⟳ on the
-  calendar and the settings' **Calendar events (CalDAV)** menu). Settings keys `caldav_url`,
-  `caldav_calendar`, `caldav_user`, `caldav_pass`.
+  a hand-rolled iCal parse (SUMMARY, DTSTART, DTEND or DURATION, LOCATION, DESCRIPTION, basic RRULE)
+  and build (the same fields; a repeat goes back as the server wrote it, as `rruleRaw`). Writes are
+  queued like the tasks' (`Todo:putEvent`, `Todo:deleteEvent` with Undo until sent): the screens see
+  the fetched events with the queue on top (`Caldav.applyQueue`), and `Todo:syncEvents` (the ⟳ on the
+  calendar, **Sync now** in its menu, or quietly after a task sync that left queued changes or after an
+  event is changed or deleted here) sends the queue and fetches again in one child process —
+  `Caldav:pushQueue` PUTs each change's iCal to the event's address (the server's own from the
+  REPORT, else the UID under the calendar's) or DELETEs it; one that fails stops the queue and the
+  rest stay queued. No If-Match: the last change wins. Editing a repeating event changes the whole
+  series; alarms and parts the parser doesn't know (EXDATE and such) an edit leaves out. Fetched
+  events and the queue live in `todo_caldav.lua` (`data.events`, `data.queue`), shown when
+  `caldav_show` is on (`Todo:caldavEvents`; the launcher's At a glance and the sleep screens read
+  today's ones through `Todo:dayEvents`, with `Caldav.dayEvents` doing the sorting in todocaldav).
+  Settings keys `caldav_url`, `caldav_calendar`,
+  `caldav_user`, `caldav_pass`; writing needs no settings of its own.
 - `todoko.lua`: a copy of `apps.koplugin/appsko.lua` with its own header. Keep it in step.
 
 What it saves:
 - `koreader/settings/todo.lua`: options and the sign-in tokens.
 - `koreader/settings/todo_tasks.lua`: the lists, the tasks and the queue (`queue`, `qseq`).
+- `koreader/settings/todo_caldav.lua`: the calendar's events as last fetched, and the changes
+  waiting to be sent (`data.events`, `data.queue`, `data.qseq`).
 - `client_id.txt` next to `main.lua`: the user's Azure app ID, if one isn't set in Settings. It's in
   `.gitignore`: never commit one.
 

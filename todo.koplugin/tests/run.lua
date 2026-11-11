@@ -680,6 +680,157 @@ do
     check("test: unreachable", rows[1].kind, "unreachable")
 end
 
+-- The write side of the calendar (CalDAV): an event built as iCal reads back
+-- the same, the queue of changes on the fetched events, and the sending.
+do
+    local Cal = require("todocaldav")
+
+    -- A timed event with everything in it, built and parsed back.
+    local ev = {
+        uid = "kindle-1", title = "Dentist, Dr. Ah\\; well",
+        starts = d * 86400 + 9 * 3600, ends = d * 86400 + 10 * 3600,
+        location = "High St. 12", notes = "Bring the card\nand the book",
+    }
+    local ics = Cal.buildIcs(ev, d * 86400)
+    check("ics has uid", ics:find("UID:kindle-1", 1, true) ~= nil, true)
+    check("ics dtstamp", ics:find("DTSTAMP:20261020T000000Z", 1, true) ~= nil, true)
+    check("ics dtstart utc", ics:find("DTSTART:20261020T090000Z", 1, true) ~= nil, true)
+    check("ics dtend utc", ics:find("DTEND:20261020T100000Z", 1, true) ~= nil, true)
+    -- The comma, the semicolon and the backslash iCal wants escaped.
+    check("ics escapes title", ics:find("SUMMARY:Dentist\\, Dr. Ah\\\\\\; well\r\n", 1, true) ~= nil, true)
+    check("ics escapes notes", ics:find("DESCRIPTION:Bring the card\\nand the book\r\n", 1, true) ~= nil, true)
+    local back = Cal.parseIcs(ics, EDT)[1]
+    check("round trip uid", back.uid, "kindle-1")
+    check("round trip title", back.title, ev.title)
+    check("round trip starts", back.starts, ev.starts)
+    check("round trip ends", back.ends, ev.ends)
+    check("round trip location", back.location, ev.location)
+    check("round trip notes", back.notes, ev.notes)
+
+    -- An all-day one over two days, and one with no end (an hour long then).
+    local back2 = Cal.parseIcs(Cal.buildIcs({ uid = "kindle-2", title = "Trip", allDay = true, day = d, days = 2 },
+        d * 86400), EDT)[1]
+    check("round trip all day", back2.allDay, true)
+    check("round trip day", back2.day, d)
+    check("round trip days", back2.days, 2)
+    local ics3 = Cal.buildIcs({ uid = "kindle-3", title = "Open end", starts = d * 86400 }, d * 86400)
+    check("ics end an hour on", ics3:find("DTEND:20261020T010000Z", 1, true) ~= nil, true)
+    check("ics leaves out what is not there", ics3:find("LOCATION", 1, true), nil)
+
+    -- A repeat goes back as the server wrote it.
+    local ics4 = Cal.buildIcs({ uid = "kindle-4", title = "Club night", starts = d * 86400,
+        rruleRaw = "FREQ=WEEKLY;BYDAY=TU,TH;COUNT=6" }, d * 86400)
+    check("ics rrule", ics4:find("RRULE:FREQ=WEEKLY;BYDAY=TU,TH;COUNT=6", 1, true) ~= nil, true)
+    local back4 = Cal.parseIcs(ics4, EDT)[1]
+    check("round trip rrule raw", back4.rruleRaw, "FREQ=WEEKLY;BYDAY=TU,TH;COUNT=6")
+    check("round trip rrule", back4.rrule.freq, "WEEKLY")
+
+    -- The day's events (what the launcher and the sleep screens show):
+    -- all-day first, then by start time, repeats included.
+    local days = {
+        { uid = "e-all", title = "Trip", allDay = true, day = d, days = 1 },
+        { uid = "e-late", title = "Dinner", starts = d * 86400 + 23 * 3600 },
+        { uid = "e-early", title = "Dentist", starts = d * 86400 + 9 * 3600 },
+        { uid = "e-daily", title = "Standup", starts = (d - 1) * 86400 + 15 * 3600,
+            rrule = Cal.parseRrule("FREQ=DAILY;COUNT=5") },
+    }
+    local todaysEvents = Cal.dayEvents(days, d, EDT)
+    check("day events count", #todaysEvents, 4)
+    check("all day first", todaysEvents[1].event.title, "Trip")
+    check("all day no minute", todaysEvents[1].minute, nil)
+    check("all day day", todaysEvents[1].day, d)
+    check("timed minute local", todaysEvents[2].minute, 5 * 60)
+    check("timed title", todaysEvents[2].event.title, "Dentist")
+    check("repeat marked", todaysEvents[3]["repeat"], true)
+    check("repeat title", todaysEvents[3].event.title, "Standup")
+    check("nothing another day", #Cal.dayEvents(days, d + 9, EDT), 0)
+
+    -- A UID for events made here, and the address one is kept at.
+    local uid = Cal.newUid(d * 86400, 3)
+    check("uid made", uid:match("^kindle%-%d+%-%x%x%x%x%x%x%x%x%-%x%x%x%x$") ~= nil, true)
+    check("uid unique", Cal.newUid(1, 1) ~= Cal.newUid(1, 1), true)
+
+    local cfg = { caldav_url = "caldav.example.com", caldav_calendar = "/user/calendar/", caldav_user = "sam", caldav_pass = "book" }
+    local function cal(handler)
+        return Cal.new{ settings = { get = function(k) return cfg[k] end }, request = handler }
+    end
+    local good = cal(function() end)
+    check("event url made", good:eventUrl({ uid = "kindle-1" }), "http://caldav.example.com/user/calendar/kindle-1.ics")
+    check("event url from the server", good:eventUrl({ href = "/cal/user/calendar/e1.ics", uid = "kindle-1" }),
+        "http://caldav.example.com/cal/user/calendar/e1.ics")
+    check("event url whole", good:eventUrl({ href = "https://dav.example.org/cal/e2.ics" }),
+        "https://dav.example.org/cal/e2.ics")
+    local unset = Cal.new{ settings = { get = function() return nil end } }
+    check("event url unset", unset:eventUrl({ uid = "kindle-1" }), nil)
+
+    -- The queue on the fetched events: added, changed in place, taken away.
+    local fetched = {
+        { uid = "srv-1", title = "From the server" },
+        { uid = "srv-2", title = "Trip" },
+        { title = "No uid", href = "/cal/n.ics" },
+    }
+    local queue = {
+        { kind = "put", event = { uid = "kindle-9", title = "Added here" } },
+        { kind = "put", event = { uid = "srv-1", title = "Changed here" } },
+        { kind = "delete", event = { uid = "srv-2" } },
+        { kind = "delete", event = { href = "/cal/n.ics" } },
+    }
+    local shown = Cal.applyQueue(fetched, queue)
+    check("queue count", #shown, 2)
+    check("queue changed in place", shown[1].title, "Changed here")
+    check("queue added", shown[2].title, "Added here")
+    check("queue leaves the fetched ones", fetched[1].title, "From the server")
+    check("queue empty", #Cal.applyQueue(fetched, {}), 3)
+
+    -- The sending: PUT with the iCal, DELETE without; the queue stops at the
+    -- first one that fails (the rest stays queued).
+    local calls
+    local function sender(statuses)
+        local i = 0
+        return cal(function(method, url, headers, body)
+            i = i + 1
+            table.insert(calls, { method = method, url = url, headers = headers, body = body,
+                auth = headers and headers.Authorization })
+            return statuses[i]
+        end)
+    end
+    local toSend = {
+        { kind = "put", event = { uid = "kindle-1", title = "Dentist",
+            starts = d * 86400 + 9 * 3600, ends = d * 86400 + 10 * 3600 } },
+        { kind = "delete", event = { uid = "srv-2", href = "/cal/t.ics", title = "Trip" } },
+    }
+    calls = {}
+    local report = sender({ 201, 204 }):pushQueue(toSend, d * 86400)
+    check("push sent", report.sent, 2)
+    check("push put first", calls[1].method, "PUT")
+    check("push put address", calls[1].url, "http://caldav.example.com/user/calendar/kindle-1.ics")
+    check("push put iCal", calls[1].body:find("BEGIN:VEVENT", 1, true) ~= nil, true)
+    check("push put sign-in", calls[1].auth ~= nil, true)
+    check("push put content type", calls[1].headers["Content-Type"], "text/calendar; charset=utf-8")
+    check("push delete second", calls[2].method, "DELETE")
+    check("push delete address", calls[2].url, "http://caldav.example.com/cal/t.ics")
+    check("push delete no body", calls[2].body, nil)
+    check("push no stop", report.stopped, nil)
+
+    calls = {}
+    report = sender({ 201, "timeout" }):pushQueue(toSend, d * 86400)
+    check("push stops on no connection", report.sent, 1)
+    check("push says why", report.stopped, "No connection: timeout")
+    report = sender({ 403 }):pushQueue(toSend, d * 86400)
+    check("push stops refused", report.sent, 0)
+    check("push refused why", report.stopped, "HTTP 403")
+    report = sender({ 404 }):pushQueue({ { kind = "delete", event = { uid = "gone" } } }, d * 86400)
+    check("push delete gone counts", report.sent, 1)
+    report = sender({ 404 }):pushQueue({ { kind = "put", event = { uid = "x", starts = d * 86400 } } }, d * 86400)
+    check("push put refused stays queued", report.sent, 0)
+    check("push put refused why", report.stopped, "HTTP 404")
+    report = sender({}):pushQueue({ { kind = "put", event = { uid = "x" } } }, d * 86400)
+    check("push put with no time stays queued", report.sent, 0)
+    check("push no time why", report.stopped, "The event has no time")
+    report = sender({}):pushQueue({}, d * 86400)
+    check("push nothing queued", report.sent, 0)
+end
+
 do
     -- Skip to current: offered only when it moves the task (a repeating task that's overdue).
     local rec = Model.preset("custom", 100, 1, "days")
