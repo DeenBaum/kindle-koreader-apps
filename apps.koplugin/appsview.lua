@@ -1831,15 +1831,52 @@ local function overdueText(t)
     return day and (_("Overdue") .. "  \u{00B7}  " .. day) or _("Overdue")
 end
 
---- The next thing with a time: a Home Assistant calendar event, else a To Do reminder today.
+--- "2:30 PM" for a minute of the day (To Do's clock), the hour alone when whole.
+local function clockText(minute)
+    local okD, Dates = pcall(require, "tododates")
+    if okD and Dates.clock then return Dates.clock(minute) end
+    return string.format("%02d:%02d", math.floor(minute / 60) % 24, minute % 60)
+end
+
+--- Today's calendar events (CalDAV) from To Do: { title, minute } sorted
+-- (all-day first); empty when the calendar is off or not set up.
+local function eventsToday(todo)
+    local ok, events = pcall(function() return todo:dayEvents() end)
+    if not ok or type(events) ~= "table" then return {} end
+    local out = {}
+    for __, e in ipairs(events) do
+        table.insert(out, { title = e.event.title, minute = e.minute })
+    end
+    return out
+end
+
+--- The next thing with a time: the earliest of a Home Assistant calendar
+-- event, a To Do calendar event (CalDAV) and a To Do reminder.
 local function nextUp(apps)
+    local best
+    local function take(title, when, icon, at)
+        if title and when and (not best or at < best.at) then
+            best = { title = title, when = when, icon = icon, at = at }
+        end
+    end
     local ha = apps:plugin("homeassistant")
     if ha and ha.snap then
         local ok, ev = pcall(function() return require("hamodel").nextEvent(ha.snap) end)
-        if ok and ev then return ev.title, ev.allDay and _("All day") or os.date("%a %I:%M %p", ev.start):gsub(" 0", " "), "calendar" end
+        if ok and ev then
+            take(ev.title, ev.allDay and _("All day") or os.date("%a %I:%M %p", ev.start):gsub(" 0", " "), "calendar", ev.start)
+        end
     end
     local todo = apps:plugin("todo")
     if todo and todo.store then
+        -- The calendar's events (CalDAV): the first one today. `minute` is
+        -- minutes from the day's local midnight; all-day events have none.
+        local okE, events = pcall(function() return todo:dayEvents() end)
+        local okO, offset = pcall(function() return todo:offset() end)
+        if okE and type(events) == "table" and events[1] then
+            local e = events[1]
+            local at = okO and e.day * 86400 + (e.minute or 0) * 60 - offset or 0
+            take(e.event.title, e.minute and clockText(e.minute) or _("All day"), "calendar", at)
+        end
         local soonest
         for __, list in ipairs(todo.store:lists()) do
             for __, t in ipairs(list.tasks or {}) do
@@ -1847,9 +1884,10 @@ local function nextUp(apps)
             end
         end
         if soonest and soonest.remindAt - os.time() < 36 * 3600 then
-            return soonest.title, os.date("%a %I:%M %p", soonest.remindAt):gsub(" 0", " "), "clock"
+            take(soonest.title, os.date("%a %I:%M %p", soonest.remindAt):gsub(" 0", " "), "clock", soonest.remindAt)
         end
     end
+    if best then return best.title, best.when, best.icon end
 end
 
 --- The line under the clock: the weather, what is next, the tasks due. Returns its height.
@@ -1947,14 +1985,16 @@ function View.drawSleep(apps, c)
         c:text(c.W - 28, y + 39, when, 12, { align = "end", color = C.GREY })
         y = y + 60
     end
-    -- Today's tasks (To Do).
+    -- Today's tasks and calendar events (To Do).
     local todo = apps:plugin("todo")
     if todo and todo.store then
         local ok, list = pcall(tasksToday, todo)
         list = ok and list or {}
-        c:text(28, y + 14, T(_("TODAY  %1"), #list), 10, { bold = true, color = C.GREY })
+        local okE, events = pcall(eventsToday, todo)
+        events = okE and events or {}
+        c:text(28, y + 14, T(_("TODAY  %1"), #list + #events), 10, { bold = true, color = C.GREY })
         y = y + 24
-        if #list == 0 then
+        if #list + #events == 0 then
             c:text(28, y + 22, _("Nothing due today."), 13, { color = C.GREY })
         end
         for __, t in ipairs(list) do
@@ -1966,6 +2006,18 @@ function View.drawSleep(apps, c)
             local due = overdueText(t)
             c:text(58, y + 23, t.title, 13, { maxw = c.W - 86 - (due and c:width(due, 11) + 16 or 0) })
             if due then c:text(c.W - 28, y + 23, due, 11, { bold = true, align = "end" }) end
+            c:hline(58, y + 34, c.W - 86)
+            y = y + 36
+        end
+        for __, e in ipairs(events) do
+            if y + 36 > c.H - 48 then
+                c:text(28, y + 22, _("… and more"), 12, { color = C.GREY })
+                break
+            end
+            c:icon("calendar-days", 28, y + 7, 20)
+            local when = e.minute and clockText(e.minute) or _("All day")
+            c:text(58, y + 23, e.title, 13, { maxw = c.W - 86 - c:width(when, 11) - 16 })
+            c:text(c.W - 28, y + 23, when, 11, { bold = true, align = "end" })
             c:hline(58, y + 34, c.W - 86)
             y = y + 36
         end
@@ -2128,16 +2180,28 @@ function View.drawWidgets(apps, c)
         if todo and todo.store then
             local ok, list = pcall(tasksToday, todo)
             list = ok and list or {}
-            local n = math.min(#list, 6)
+            local okE, events = pcall(eventsToday, todo)
+            events = okE and events or {}
+            local n = math.min(#list + #events, 6)
             card(46 + math.max(1, n) * 32, function(yy)
-                heading(yy, T(_("TODAY  %1"), #list), agoText(try(function() return todo.store:syncedAt() end)))
-                if #list == 0 then c:text(46, yy + 60, _("Nothing due today."), 13, { color = C.GREY }) end
-                for i = 1, n do
-                    local t, ty = list[i], yy + 38 + (i - 1) * 32
+                heading(yy, T(_("TODAY  %1"), #list + #events), agoText(try(function() return todo.store:syncedAt() end)))
+                if n == 0 then c:text(46, yy + 60, _("Nothing due today."), 13, { color = C.GREY }) end
+                local ty = yy + 38
+                for i = 1, math.min(#list, n) do
+                    local t = list[i]
                     c:box(46, ty + 4, 18, 18, { r = 4, border = C.BLACK, bw = 1.3 })
                     local due = overdueText(t)
                     c:text(76, ty + 19, t.title, 13, { maxw = c.W - 122 - (due and c:width(due, 11) + 16 or 0) })
                     if due then c:text(c.W - 46, ty + 19, due, 11, { bold = true, align = "end" }) end
+                    ty = ty + 32
+                end
+                for i = 1, math.max(0, math.min(#events, n - #list)) do
+                    local e = events[i]
+                    c:icon("calendar-days", 46, ty + 3, 18)
+                    local when = e.minute and clockText(e.minute) or _("All day")
+                    c:text(76, ty + 19, e.title, 13, { maxw = c.W - 122 - c:width(when, 11) - 16 })
+                    c:text(c.W - 46, ty + 19, when, 11, { bold = true, align = "end" })
+                    ty = ty + 32
                 end
             end)
         end

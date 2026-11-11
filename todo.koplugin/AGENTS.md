@@ -50,7 +50,9 @@ next sync.
   rest stay queued. No If-Match: the last change wins. Editing a repeating event changes the whole
   series; alarms and parts the parser doesn't know (EXDATE and such) an edit leaves out. Fetched
   events and the queue live in `todo_caldav.lua` (`data.events`, `data.queue`), shown when
-  `caldav_show` is on (`Todo:caldavEvents`). Settings keys `caldav_url`, `caldav_calendar`,
+  `caldav_show` is on (`Todo:caldavEvents`; the launcher's At a glance and the sleep screens read
+  today's ones through `Todo:dayEvents`, with `Caldav.dayEvents` doing the sorting in todocaldav).
+  Settings keys `caldav_url`, `caldav_calendar`,
   `caldav_user`, `caldav_pass`; writing needs no settings of its own.
 - `todoko.lua`: a copy of `apps.koplugin/appsko.lua` with its own header. Keep it in step.
 

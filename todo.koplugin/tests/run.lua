@@ -725,6 +725,26 @@ do
     check("round trip rrule raw", back4.rruleRaw, "FREQ=WEEKLY;BYDAY=TU,TH;COUNT=6")
     check("round trip rrule", back4.rrule.freq, "WEEKLY")
 
+    -- The day's events (what the launcher and the sleep screens show):
+    -- all-day first, then by start time, repeats included.
+    local days = {
+        { uid = "e-all", title = "Trip", allDay = true, day = d, days = 1 },
+        { uid = "e-late", title = "Dinner", starts = d * 86400 + 23 * 3600 },
+        { uid = "e-early", title = "Dentist", starts = d * 86400 + 9 * 3600 },
+        { uid = "e-daily", title = "Standup", starts = (d - 1) * 86400 + 15 * 3600,
+            rrule = Cal.parseRrule("FREQ=DAILY;COUNT=5") },
+    }
+    local todaysEvents = Cal.dayEvents(days, d, EDT)
+    check("day events count", #todaysEvents, 4)
+    check("all day first", todaysEvents[1].event.title, "Trip")
+    check("all day no minute", todaysEvents[1].minute, nil)
+    check("all day day", todaysEvents[1].day, d)
+    check("timed minute local", todaysEvents[2].minute, 5 * 60)
+    check("timed title", todaysEvents[2].event.title, "Dentist")
+    check("repeat marked", todaysEvents[3]["repeat"], true)
+    check("repeat title", todaysEvents[3].event.title, "Standup")
+    check("nothing another day", #Cal.dayEvents(days, d + 9, EDT), 0)
+
     -- A UID for events made here, and the address one is kept at.
     local uid = Cal.newUid(d * 86400, 3)
     check("uid made", uid:match("^kindle%-%d+%-%x%x%x%x%x%x%x%x%-%x%x%x%x$") ~= nil, true)

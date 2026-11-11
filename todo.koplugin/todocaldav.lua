@@ -307,6 +307,24 @@ function Caldav.occurrences(event, first, last, offset)
     return out
 end
 
+--- The events on one `day` (a day number), each `{ event, day, minute,
+-- ["repeat"] }` (all-day ones have no minute): all-day first, then by start
+-- time, then title. What the launcher and the sleep screen show as today's events.
+function Caldav.dayEvents(events, day, offset)
+    local out = {}
+    for _, ev in ipairs(events or {}) do
+        for __, occ in ipairs(Caldav.occurrences(ev, day, day, offset)) do
+            table.insert(out, { event = ev, day = day, minute = occ.minute, ["repeat"] = occ["repeat"] })
+        end
+    end
+    table.sort(out, function(a, b)
+        local ma, mb = a.minute or -1, b.minute or -1
+        if ma ~= mb then return ma < mb end
+        return (a.event.title or ""):lower() < (b.event.title or ""):lower()
+    end)
+    return out
+end
+
 -- ------------------------------------------------------------------ writing
 
 -- A day as iCal writes it ("20261020").
