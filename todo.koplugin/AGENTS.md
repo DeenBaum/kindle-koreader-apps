@@ -43,7 +43,8 @@ next sync.
   and build (the same fields; a repeat goes back as the server wrote it, as `rruleRaw`). Writes are
   queued like the tasks' (`Todo:putEvent`, `Todo:deleteEvent` with Undo until sent): the screens see
   the fetched events with the queue on top (`Caldav.applyQueue`), and `Todo:syncEvents` (the ⟳ on the
-  calendar, **Sync now** in its menu) sends the queue and fetches again in one child process —
+  calendar, **Sync now** in its menu, or quietly after a task sync that left queued changes or after an
+  event is changed or deleted here) sends the queue and fetches again in one child process —
   `Caldav:pushQueue` PUTs each change's iCal to the event's address (the server's own from the
   REPORT, else the UID under the calendar's) or DELETEs it; one that fails stops the queue and the
   rest stay queued. No If-Match: the last change wins. Editing a repeating event changes the whole

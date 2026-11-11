@@ -1829,6 +1829,9 @@ function Todo:syncFinished(ok, report, quiet)
     end
     self:reportSync(report, quiet)
     self:pruneReminderNotes()
+    -- The calendar's queued changes go with the task sync (quiet: its own
+    -- notifications only).
+    if self.caldav:configured() and #self.caldavQueue > 0 then self:syncEvents(true) end
     self:render()
 end
 
@@ -2067,6 +2070,8 @@ function Todo:deleteEvent(ev)
     self:saveCaldavData()
     self:sortAgain()
     self:render()
+    -- The change goes to the server at once (in the background, quietly).
+    self:syncEvents(true)
     require("todoko").undo(T(_("Deleted: %1"), ev.title), function()
         for i, o in ipairs(self.caldavQueue) do
             if o == op then table.remove(self.caldavQueue, i) break end
@@ -2117,12 +2122,22 @@ end
 
 --- The calendar's sync, in a child process (each request can wait on the
 -- network; the screen keeps answering). The changes made here go first, then
--- the server's events are fetched again. Only when you ask: the ⟳ on the
--- calendar, or **Sync now** in its menu.
-function Todo:syncEvents()
+-- the server's events are fetched again. Runs on its own (the ⟳ on the
+-- calendar, **Sync now** in its menu), after a task sync that left queued
+-- changes, and after an event is changed or deleted here. `quiet` skips the
+-- waiting box (the caller is already telling the user what is going on).
+function Todo:syncEvents(quiet)
     if not self.caldav:configured() then return self:calendarMenu() end
+    -- One at a time; a change made while one runs goes with the next. Quiet
+    -- runs (after an edit or a task sync) only run when online: offline is a
+    -- normal state, the queue stays for the next sync. The ⟳ still asks to
+    -- turn Wi-Fi on.
+    if self.caldavSyncing then return end
+    if quiet and not NetworkMgr:isConnected() then return end
     NetworkMgr:runWhenOnline(function()
-        local waitBox = require("todoko").wait(_("Syncing the calendar…"))
+        if self.caldavSyncing then return end
+        self.caldavSyncing = true
+        local waitBox = quiet and nil or require("todoko").wait(_("Syncing the calendar…"))
         local cal = self.caldav
         local offset = self:offset()
         local today = self:today()
@@ -2141,8 +2156,9 @@ function Todo:syncEvents()
             ffiutil.writeToFD(write_fd, require("dump")({ pushed = pushed, events = events, why = why }), true)
         end, true)
         if not pid then
-            waitBox:close()
-            return self:caldavFailed(tostring(fd))
+            self.caldavSyncing = false
+            if waitBox then waitBox:close() end
+            return self:caldavFailed(tostring(fd), quiet)
         end
         local deadline = os.time() + 120
         local function reap() if not ffiutil.isSubProcessDone(pid) then UIManager:scheduleIn(1, reap) end end
@@ -2154,21 +2170,23 @@ function Todo:syncEvents()
                 -- Stuck (a server that never answers): stopped; what's shown stays.
                 ffiutil.terminateSubProcess(pid)
                 reap()
-                waitBox:close()
-                return self:caldavFailed(_("The calendar server took too long to answer"))
+                self.caldavSyncing = false
+                if waitBox then waitBox:close() end
+                return self:caldavFailed(_("The calendar server took too long to answer"), quiet)
             end
+            self.caldavSyncing = false
             local raw = (size and size > 0) and ffiutil.readAllFromFD(fd) or ""
             if not exited then reap() end
             local fn = raw ~= "" and loadstring("return " .. raw)
             local ok, out = pcall(fn or error)
-            waitBox:close()
+            if waitBox then waitBox:close() end
             if ok and type(out) == "table" then
                 if out.events then self:caldavFetched(out.events) end
                 self:caldavPushed(out.pushed, qids)
                 self:saveCaldavData()
-                if not out.events then self:caldavFailed(out.why) end
+                if not out.events then self:caldavFailed(out.why, quiet) end
             else
-                self:caldavFailed(_("Could not read the answer"))
+                self:caldavFailed(_("Could not read the answer"), quiet)
             end
         end
         UIManager:scheduleIn(0.3, check)
@@ -2213,10 +2231,10 @@ end
 
 --- A calendar fetch that didn't come off: what's shown stays, a note waits in
 -- the notifications until a fetch succeeds.
-function Todo:caldavFailed(why)
+function Todo:caldavFailed(why, quiet)
     logger.warn("To Do calendar:", why)
     self:notify(T(_("Could not fetch the calendar: %1"), tostring(why)), "todo:caldav")
-    require("todoko").message(T(_("Could not fetch the calendar:\n%1"), tostring(why)))
+    if not quiet then require("todoko").message(T(_("Could not fetch the calendar: %1"), tostring(why))) end
     self:render()
 end
 
@@ -2294,6 +2312,8 @@ function Todo:saveEvent(state, ev, title)
         state.endMinute = state.startMinute + 60
     end
     self:putEvent(self:eventFrom(state, ev))
+    -- The change goes to the server at once (in the background, quietly).
+    self:syncEvents(true)
     notify(ev and _("Event changed") or _("Event added"))
 end
 
