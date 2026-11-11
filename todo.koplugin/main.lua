@@ -113,9 +113,14 @@ function Todo:init()
         json = require("json"),
     }
     self.caldav = Cal.new{ settings = settings, request = httpRequest }
-    -- The calendar's events (CalDAV), as last fetched (todo_caldav.lua).
+    -- The calendar's events (CalDAV), as last fetched (todo_caldav.lua), and
+    -- the changes made here that wait to be sent.
     self.caldavFile = LuaSettings:open(DataStorage:getSettingsDir() .. "/todo_caldav.lua")
-    self.caldavEvents = self.caldavFile:readSetting("data", {}).events or {}
+    local calData = self.caldavFile:readSetting("data", {})
+    self.caldavRaw = calData.events or {}
+    self.caldavQueue = calData.queue or {}
+    self.caldavQseq = calData.qseq or 0
+    self.caldavEvents = Cal.applyQueue(self.caldavRaw, self.caldavQueue)
     self:useMicrosoftAccount()
     self:openStore()
     -- The clock: KOReader's own setting, the same in every app.
@@ -2033,6 +2038,45 @@ function Todo:saveCaldav(key, value)
     self:render()
 end
 
+--- The calendar's copy kept (todo_caldav.lua): what was fetched, the changes
+-- waiting to be sent, and what the screens show (the fetched ones with the
+-- queue's changes on top).
+function Todo:saveCaldavData()
+    self.caldavEvents = Cal.applyQueue(self.caldavRaw, self.caldavQueue)
+    self.caldavFile:saveSetting("data", { events = self.caldavRaw, queue = self.caldavQueue,
+        qseq = self.caldavQseq, syncedAt = self.caldavSyncedAt })
+    self.caldavFile:flush()
+end
+
+--- An event added or changed here: shown at once, queued for the server.
+function Todo:putEvent(ev)
+    self.caldavQseq = self.caldavQseq + 1
+    table.insert(self.caldavQueue, { kind = "put", qid = self.caldavQseq, event = Store.copy(ev) })
+    self:saveCaldavData()
+    self:sortAgain()
+    self:render()
+end
+
+--- An event taken away here: gone from the calendar at once, queued for the
+-- server, with Undo until it is sent.
+function Todo:deleteEvent(ev)
+    self.caldavQseq = self.caldavQseq + 1
+    local op = { kind = "delete", qid = self.caldavQseq,
+        event = { uid = ev.uid, href = ev.href, title = ev.title } }
+    table.insert(self.caldavQueue, op)
+    self:saveCaldavData()
+    self:sortAgain()
+    self:render()
+    require("todoko").undo(T(_("Deleted: %1"), ev.title), function()
+        for i, o in ipairs(self.caldavQueue) do
+            if o == op then table.remove(self.caldavQueue, i) break end
+        end
+        self:saveCaldavData()
+        self:render()
+    end)
+    return op
+end
+
 --- The calendar's menu (Settings > Calendar events, or ⟳ on the calendar when
 -- nothing is set up): the server, its calendar, the sign-in, show or hide.
 function Todo:calendarMenu()
@@ -2060,7 +2104,7 @@ function Todo:calendarMenu()
                     self.settings:delSetting(key)
                 end
                 self.settings:flush()
-                self.caldavEvents = {}
+                self.caldavRaw, self.caldavQueue, self.caldavEvents = {}, {}, {}
                 self.caldavFile:delSetting("data")
                 self.caldavFile:flush()
                 local PS = require("pluginshare")
@@ -2071,20 +2115,30 @@ function Todo:calendarMenu()
     })
 end
 
---- The calendar's events from the CalDAV server, in a child process (the
--- request can wait on the network; the screen keeps answering). Only synced
--- when you ask: the ⟳ on the calendar, or **Sync now** in its menu.
+--- The calendar's sync, in a child process (each request can wait on the
+-- network; the screen keeps answering). The changes made here go first, then
+-- the server's events are fetched again. Only when you ask: the ⟳ on the
+-- calendar, or **Sync now** in its menu.
 function Todo:syncEvents()
     if not self.caldav:configured() then return self:calendarMenu() end
     NetworkMgr:runWhenOnline(function()
-        local waitBox = require("todoko").wait(_("Fetching the calendar…"))
+        local waitBox = require("todoko").wait(_("Syncing the calendar…"))
         local cal = self.caldav
         local offset = self:offset()
         local today = self:today()
         local from, until_ = (today - Cal.BEFORE) * 86400, (today + Cal.AFTER) * 86400
+        -- The queue as it is now: changes made while it works are kept here and
+        -- go with the next one. Each change has a number (qid), so what the
+        -- child sent can be told from what was added here meanwhile.
+        local qids = {}
+        for __, op in ipairs(self.caldavQueue) do
+            if op.qid then table.insert(qids, op.qid) end
+        end
+        local queue = Store.copy(self.caldavQueue)
         local pid, fd = ffiutil.runInSubProcess(function(_, write_fd)
+            local pushed = #queue > 0 and cal:pushQueue(queue) or nil
             local events, why = cal:fetch(from, until_, offset)
-            ffiutil.writeToFD(write_fd, require("dump")({ events = events, why = why }), true)
+            ffiutil.writeToFD(write_fd, require("dump")({ pushed = pushed, events = events, why = why }), true)
         end, true)
         if not pid then
             waitBox:close()
@@ -2109,7 +2163,10 @@ function Todo:syncEvents()
             local ok, out = pcall(fn or error)
             waitBox:close()
             if ok and type(out) == "table" then
-                self:caldavFetched(out.events, out.why)
+                if out.events then self:caldavFetched(out.events) end
+                self:caldavPushed(out.pushed, qids)
+                self:saveCaldavData()
+                if not out.events then self:caldavFailed(out.why) end
             else
                 self:caldavFailed(_("Could not read the answer"))
             end
@@ -2118,12 +2175,35 @@ function Todo:syncEvents()
     end)
 end
 
+--- What the child sent of the queue: the ones that went (`qids`, the numbers
+-- of the queue as the child took it) leave the queue and go into the fetched
+-- copy, so the screens stay right if the fetch after them failed.
+function Todo:caldavPushed(pushed, qids)
+    if not pushed then return end
+    if pushed.sent > 0 and qids then
+        local sent = {}
+        for i = 1, math.min(pushed.sent, #qids) do sent[qids[i]] = true end
+        for i = #self.caldavQueue, 1, -1 do
+            local op = self.caldavQueue[i]
+            if op.qid and sent[op.qid] then
+                table.remove(self.caldavQueue, i)
+                if op.kind == "delete" then Cal.removeEvent(self.caldavRaw, op.event)
+                else Cal.applyEvent(self.caldavRaw, op.event) end
+            end
+        end
+    end
+    if pushed.stopped then
+        self:notify(T(_("Could not send to the calendar (kept for the next sync): %1"), tostring(pushed.stopped)),
+            "todo:caldav")
+    end
+end
+
 --- The events the child fetched: kept (todo_caldav.lua), the screen drawn again.
 function Todo:caldavFetched(events, why)
     if not events then return self:caldavFailed(why) end
-    self.caldavEvents = events
-    self.caldavFile:saveSetting("data", { events = events, syncedAt = os.time() })
-    self.caldavFile:flush()
+    self.caldavRaw = events
+    self.caldavSyncedAt = os.time()
+    self:saveCaldavData()
     local PS = require("pluginshare")
     if PS.unnotify then pcall(PS.unnotify, "todo:caldav") end
     notify(#events == 0 and _("Calendar: no events") or T(_("Calendar: %1 events"), #events))
@@ -2140,7 +2220,8 @@ function Todo:caldavFailed(why)
     self:render()
 end
 
---- A calendar event's details (read only).
+--- A calendar event's details, with Edit and Delete (both go to its server at
+-- the calendar's next sync).
 function Todo:showEvent(ev, day, minute)
     local lines
     if ev.allDay then
@@ -2157,8 +2238,275 @@ function Todo:showEvent(ev, day, minute)
     if ev.location and ev.location ~= "" then lines = lines .. "\n" .. ev.location end
     if ev.notes and ev.notes ~= "" then lines = lines .. "\n\n" .. ev.notes end
     local P = require("pluginshare").popup
-    if P and P.read then return P.read{ title = ev.title, text = lines } end
-    require("todoko").message(ev.title .. "\n\n" .. lines)
+    if P and P.read then
+        return P.read{ title = ev.title, text = lines, buttons = {
+            { icon = "pencil", text = _("Edit"), fn = function() self:editEvent(ev) end },
+            { icon = "trash-2", text = _("Delete"), fn = function() self:deleteEvent(ev) end },
+            { icon = "check", text = _("Close"), primary = true },
+        } }
+    end
+    -- Without the launcher: the details first, then Edit and Delete.
+    require("todoko").message({ text = ev.title .. "\n\n" .. lines, onOk = function()
+        require("todoko").list(ev.title, {
+            { text = _("Edit"), fn = function() self:editEvent(ev) end },
+            { text = _("Delete"), fn = function() self:deleteEvent(ev) end },
+        })
+    end })
+end
+
+-- ------------------------------------------------------------------ event dialogs
+
+--- A new event on a day (the + on the calendar).
+function Todo:addEvent(day)
+    return self:editEvent(nil, day)
+end
+
+--- The event the dialog's state holds, as the calendar keeps them: an all-day
+-- one with day and days, a timed one with starts and ends (Unix seconds). An
+-- event already on the server keeps its UID, its address and its repeat.
+function Todo:eventFrom(state, ev)
+    local out = {
+        uid = ev and ev.uid or Cal.newUid(),
+        href = ev and ev.href or nil,
+        rruleRaw = ev and ev.rruleRaw or nil,
+        title = state.title,
+        location = state.location,
+        notes = state.notes,
+    }
+    if state.allDay then
+        out.allDay = true
+        out.day = state.day
+        out.days = state.days or 1
+    else
+        out.starts = self:moment(state.day, state.startMinute)
+        out.ends = self:moment(state.day + (state.endDay or 0), state.endMinute)
+    end
+    return out
+end
+
+--- What Save does in the event's dialogs: the state becomes the event, added
+-- or changed, queued for the server.
+function Todo:saveEvent(state, ev, title)
+    state.title = (title or ""):match("^%s*(.-)%s*$")
+    if state.title == "" then return end
+    -- An end before the start on the same day is an hour after it.
+    if not state.allDay and (state.endDay or 0) == 0 and state.endMinute <= state.startMinute then
+        state.endMinute = state.startMinute + 60
+    end
+    self:putEvent(self:eventFrom(state, ev))
+    notify(ev and _("Event changed") or _("Event added"))
+end
+
+--- Adding (ev nil: a new one on `day`) or editing a calendar event.
+function Todo:editEvent(ev, day)
+    if not self.caldav:configured() then return end
+    local offset = self:offset()
+    local state = { allDay = false, day = day or self:today(), startMinute = 9 * 60, endMinute = 10 * 60, endDay = 0, days = 1 }
+    if ev then
+        state.title = ev.title ~= "(no title)" and ev.title or ""
+        state.location = ev.location
+        state.notes = ev.notes
+        if ev.allDay then
+            state.allDay, state.day, state.days = true, ev.day, ev.days or 1
+        elseif ev.starts then
+            state.day = math.floor((ev.starts + offset) / 86400)
+            state.startMinute = math.floor((ev.starts + offset) % 86400 / 60)
+            if ev.ends then
+                state.endMinute = math.floor((ev.ends + offset) % 86400 / 60)
+                state.endDay = math.max(0, math.floor((ev.ends + offset) / 86400) - state.day)
+            end
+        end
+    end
+    if self:eventBox(state, ev) then return end
+    self:eventDialog(state, ev)
+end
+
+--- The launcher's box: the title typed, the when and where as chips under it.
+-- False without the launcher.
+function Todo:eventBox(state, ev)
+    local P = require("pluginshare").popup
+    if not (P and P.request) then return false end
+    local box
+    local function redraw() if box then box:redraw() end end
+    local function pickDay()
+        self:pickDate(state.day, _("Event day"), function(day) state.day = day redraw() end)
+    end
+    local function pickDays()
+        UIManager:show(SpinWidget:new{
+            title_text = _("How many days?"), value = state.days or 1, value_min = 1, value_max = 30,
+            value_step = 1, ok_text = _("Set"),
+            callback = function(spin) state.days = spin.value redraw() end,
+        })
+    end
+    local function pickStart()
+        self:pickTime(state.startMinute, _("Start time"), function(minute)
+            state.startMinute = minute
+            -- An end at or before the start runs an hour after it (same day).
+            if (state.endDay or 0) == 0 and state.endMinute <= minute then state.endMinute = minute + 60 end
+            redraw()
+        end)
+    end
+    local function pickEnd()
+        self:pickTime(state.endMinute, _("End time"), function(minute)
+            -- Before the start: into the next day (an event over midnight).
+            state.endDay = minute < state.startMinute and 1 or 0
+            state.endMinute = minute
+            redraw()
+        end)
+    end
+    local sections = {}
+    local function whenChips()
+        local row
+        if state.allDay then
+            row = {
+                { text = _("All day"), on = true },
+                { text = function() return Dates.short(state.day) end, tap = pickDay },
+                { text = function() return (state.days or 1) > 1 and T(_("%1 days"), state.days) or _("1 day") end,
+                    on = function() return (state.days or 1) > 1 end, tap = pickDays },
+            }
+        else
+            row = {
+                { text = _("All day"), on = false },
+                { text = function() return Dates.short(state.day) end, tap = pickDay },
+                { text = function() return T(_("Start %1"), Dates.clock(state.startMinute)) end, tap = pickStart },
+                { text = function() return T(_("End %1"), Dates.clock(state.endMinute)) end, tap = pickEnd },
+            }
+        end
+        row[1].tap = function()
+            state.allDay = not state.allDay
+            sections[1].chips = whenChips()
+        end
+        return row
+    end
+    local function whereChips()
+        return {
+            { text = _("Location"), on = function() return state.location ~= nil end, tap = function()
+                input(_("Location"), state.location, function(v)
+                    state.location = v ~= "" and v or nil
+                    redraw()
+                end)
+            end },
+            { text = _("Notes"), on = function() return state.notes ~= nil end, tap = function()
+                input(_("Notes"), state.notes, function(v)
+                    state.notes = v ~= "" and v or nil
+                    redraw()
+                end, { multiline = true })
+            end },
+        }
+    end
+    sections = {
+        { chips = whenChips() },
+        { chips = whereChips() },
+    }
+    box = P.request{
+        app = "todo",
+        title = ev and _("Edit event") or _("New event"),
+        text = state.title or "",
+        hint = _("Event title"),
+        typing = true,
+        pen = (function()
+            local hw = require("pluginshare").handwriting
+            local ok, on = pcall(function() return hw and hw.available() end)
+            return (ok and on) and true or nil
+        end)(),
+        penTitle = ev and _("Edit event") or _("New event"),
+        penKind = "text",
+        sections = sections,
+        buttons = {
+            { icon = "x", text = _("Cancel"), cancel = true },
+            { icon = "check", text = _("Save"), primary = true, needsText = true,
+                fn = function(text) self:saveEvent(state, ev, text) end },
+        },
+    }
+    return true
+end
+
+--- The event's dialog without the launcher: KOReader's own, the options as
+-- buttons, every row the same number of buttons.
+function Todo:eventDialog(state, ev)
+    local dialog
+    local function reopen(change)
+        state.title = dialog:getInputText()
+        UIManager:close(dialog)
+        change(function() self:eventDialog(state, ev) end)
+    end
+    local function pickDays(back)
+        UIManager:show(SpinWidget:new{
+            title_text = _("How many days?"), value = state.days or 1, value_min = 1, value_max = 30,
+            value_step = 1, ok_text = _("Set"),
+            callback = function(spin)
+                state.days = spin.value
+                if back then back() end
+            end,
+        })
+    end
+    local buttons = {
+        { text = Dates.short(state.day), callback = function()
+            reopen(function(back) self:pickDate(state.day, _("Event day"), function(day) state.day = day back() end) end)
+        end },
+        { text = state.allDay and _("All day") or _("Timed"), font_bold = state.allDay, callback = function()
+            reopen(function(back) state.allDay = not state.allDay back() end)
+        end },
+    }
+    if state.allDay then
+        table.insert(buttons, { text = (state.days or 1) > 1 and T(_("%1 days"), state.days) or _("1 day"),
+            font_bold = (state.days or 1) > 1, callback = function()
+                reopen(function(back) pickDays(back) end)
+            end })
+    else
+        table.insert(buttons, { text = T(_("Start %1"), Dates.clock(state.startMinute)), callback = function()
+            reopen(function(back)
+                self:pickTime(state.startMinute, _("Start time"), function(minute)
+                    state.startMinute = minute
+                    if (state.endDay or 0) == 0 and state.endMinute <= minute then state.endMinute = minute + 60 end
+                    back()
+                end)
+            end)
+        end })
+        table.insert(buttons, { text = T(_("End %1"), Dates.clock(state.endMinute)), callback = function()
+            reopen(function(back)
+                self:pickTime(state.endMinute, _("End time"), function(minute)
+                    state.endDay = minute < state.startMinute and 1 or 0
+                    state.endMinute = minute
+                    back()
+                end)
+            end)
+        end })
+    end
+    table.insert(buttons, { text = _("Location"), font_bold = state.location ~= nil, callback = function()
+        reopen(function(back)
+            input(_("Location"), state.location, function(v) state.location = v ~= "" and v or nil back() end)
+        end)
+    end })
+    table.insert(buttons, { text = _("Notes"), font_bold = state.notes ~= nil, callback = function()
+        reopen(function(back)
+            input(_("Notes"), state.notes, function(v) state.notes = v ~= "" and v or nil back() end, { multiline = true })
+        end)
+    end })
+    -- Greyed on a new event, so every row keeps the same number of buttons.
+    table.insert(buttons, { text = _("Delete"), enabled = ev ~= nil, callback = function()
+        UIManager:close(dialog)
+        self:deleteEvent(ev)
+    end })
+    table.insert(buttons, { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end })
+    table.insert(buttons, { text = _("Save"), is_enter_default = true, callback = function()
+        local typed = dialog:getInputText()
+        UIManager:close(dialog)
+        self:saveEvent(state, ev, typed)
+    end })
+    local cols = #buttons % 3 == 0 and 3 or 2
+    local rows = {}
+    for i, b in ipairs(buttons) do
+        if (i - 1) % cols == 0 then table.insert(rows, {}) end
+        table.insert(rows[#rows], b)
+    end
+    dialog = InputDialog:new{
+        title = ev and _("Edit event") or _("New event"),
+        input = state.title or "",
+        buttons = rows,
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
 end
 
 --- Downloads To Do's copy and counts what differs from the reader's last

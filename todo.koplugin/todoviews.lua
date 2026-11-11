@@ -918,6 +918,7 @@ function Views.calendar(c, view)
     end
     local selDay = cal.first + view.sel - 1
     local entries = cal.days[view.sel] or {}
+    local showEvents = c:caldavEvents() ~= nil
     local nTasks, nEvents = 0, 0
     for __, e in ipairs(entries) do
         if e.event then nEvents = nEvents + 1 else nTasks = nTasks + 1 end
@@ -927,7 +928,9 @@ function Views.calendar(c, view)
         table.insert(rows, e.event and Views.eventRow(c, e, selDay) or Views.taskRow(c, e, { withList = true }))
     end
     if #entries == 0 then
-        table.insert(rows, Views.messageRow(_("Nothing due. Hold a day to add a task.")))
+        table.insert(rows, Views.messageRow(showEvents
+            and _("Nothing due. Hold a day to add a task; the + adds an event.")
+            or _("Nothing due. Hold a day to add a task.")))
     else
         table.insert(rows, { h = 28, draw = function(p, y)
             p:text(14, y + 20, _("Hollow dot: overdue. Tap a day for its tasks; hold a day to add one."), 9.5, false, MID, "start", W - 28)
@@ -947,6 +950,13 @@ function Views.calendar(c, view)
         right = { { icon = "refresh-cw", fn = function() c:syncEvents() end },
             { icon = "chevron-right", fn = function() month(1) end }, { icon = "chevron-left", fn = function() month(-1) end } },
         rows = rows,
+        -- + adds an event on the day selected (when the calendar's events show).
+        reserve = showEvents and 52 or 0,
+        after = showEvents and function(p, zone, W, H)
+            p:circle(W - 40, H - 70, 22, BLACK)
+            p:icon("plus", W - 51, H - 81, 22, true)
+            zone(W - 64, H - 94, 48, 48, function() c:addEvent(selDay) end, function() c:addEvent(selDay) end)
+        end or nil,
     }
 end
 

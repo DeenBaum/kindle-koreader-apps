@@ -1,12 +1,15 @@
 --[[--
-Calendar events from a CalDAV server, shown in To Do's calendar. Read only:
-what the server has is fetched and kept on the Kindle, nothing is sent back.
+Calendar events from a CalDAV server, shown in To Do's calendar. Read from it,
+and written to: events added or changed on the Kindle are built as iCal and
+PUT to the server, taken-away ones DELETEd (the changes wait in a queue until
+the calendar is synced again).
 
 A GET of the calendar's address serves most servers their events whole; when
 the answer isn't a calendar, a REPORT calendar-query asks the collection for
 the events in a window. Plain Lua (no KOReader modules) for the tests; the
 network and the settings are passed in, as todoapi does. A time with a Z is
-UTC; one without (or with a TZID) is taken as this Kindle's time.
+UTC; one without (or with a TZID) is taken as this Kindle's time. Times the
+Kindle writes are UTC (with a Z), so every client reads the same moment.
 ]]
 
 local Dates = require("tododates")
@@ -26,6 +29,12 @@ local function unescape(text)
     text = text:gsub("\\\\", "\1")
     text = text:gsub("\\n", "\n"):gsub("\\N", "\n"):gsub("\\,", ","):gsub("\\;", ";")
     return (text:gsub("\1", "\\"))
+end
+
+-- The other way: text as iCal wants it in a property's value.
+local function escape(text)
+    text = tostring(text or ""):gsub("\\", "\\\\"):gsub(";", "\\;"):gsub(",", "\\,")
+    return (text:gsub("\r?\n", "\\n"))
 end
 
 function Caldav.base64(data)
@@ -186,7 +195,10 @@ function Caldav.parseIcs(text, offset)
             local endStamp = props.DTEND and parseStamp(props.DTEND.value) or nil
             event.days = endStamp and math.max(1, endStamp.day - start.day) or 1
         end
-        if props.RRULE then event.rrule = Caldav.parseRrule(props.RRULE.value) end
+        if props.RRULE then
+            event.rruleRaw = props.RRULE.value
+            event.rrule = Caldav.parseRrule(props.RRULE.value)
+        end
         if event.uid and seen[event.uid] then return end
         if event.uid then seen[event.uid] = true end
         table.insert(events, event)
@@ -295,6 +307,159 @@ function Caldav.occurrences(event, first, last, offset)
     return out
 end
 
+-- ------------------------------------------------------------------ writing
+
+-- A day as iCal writes it ("20261020").
+local function dayStamp(day) return os.date("!%Y%m%d", day * 86400) end
+
+-- A moment as iCal writes it, in UTC ("20261020T133000Z").
+local function utcStamp(seconds) return os.date("!%Y%m%dT%H%M%SZ", math.floor(seconds)) end
+
+--- A UID for an event made on the Kindle (also its file's name on servers
+-- that keep one event per resource): the time, a counter and two random
+-- parts. `now` and `n` stand in for them in the tests.
+function Caldav.newUid(now, n)
+    now = now or os.time()
+    n = n or 0
+    return string.format("kindle-%d-%04x%04x-%04x", now, n % 65536, math.random(0, 65535), math.random(0, 65535))
+end
+
+--- One event as iCal (a whole VCALENDAR, what a PUT sends). `event` is as
+-- parseIcs keeps them: uid, title, allDay with day and days, or starts and
+-- ends, location, notes; `rruleRaw` (a repeat kept as the server wrote it)
+-- goes back as it came. `stamp` (Unix seconds) is DTSTAMP. Lines are not
+-- folded (RFC 5545's 75 octets is a should, and every server takes long ones).
+function Caldav.buildIcs(event, stamp)
+    local out = {
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//KOReader To Do//EN",
+        "BEGIN:VEVENT",
+        "UID:" .. tostring(event.uid or ""),
+        "DTSTAMP:" .. utcStamp(stamp or os.time()),
+    }
+    if event.allDay then
+        table.insert(out, "DTSTART;VALUE=DATE:" .. dayStamp(event.day))
+        table.insert(out, "DTEND;VALUE=DATE:" .. dayStamp(event.day + (event.days or 1)))
+    else
+        table.insert(out, "DTSTART:" .. utcStamp(event.starts))
+        table.insert(out, "DTEND:" .. utcStamp(event.ends or event.starts + 3600))
+    end
+    table.insert(out, "SUMMARY:" .. escape(event.title))
+    if event.location and event.location ~= "" then table.insert(out, "LOCATION:" .. escape(event.location)) end
+    if event.notes and event.notes ~= "" then table.insert(out, "DESCRIPTION:" .. escape(event.notes)) end
+    if event.rruleRaw and event.rruleRaw ~= "" then table.insert(out, "RRULE:" .. event.rruleRaw) end
+    table.insert(out, "END:VEVENT")
+    table.insert(out, "END:VCALENDAR")
+    return table.concat(out, "\r\n") .. "\r\n"
+end
+
+--- The address one event is kept at: the server's own (from the REPORT, kept
+-- with the event) when we know it, else the calendar's with the UID as the
+-- resource's name.
+function Caldav:eventUrl(event)
+    local href = event.href
+    if href and href ~= "" then
+        if href:find("^https?://") then return href end
+        local base = self:calendarUrl()
+        local host = base and base:match("^(https?://[^/]+)")
+        if host then return host .. (href:sub(1, 1) == "/" and href or "/" .. href) end
+        return href
+    end
+    local base = self:calendarUrl()
+    if not base then return nil end
+    return base:gsub("/+$", "") .. "/" .. tostring(event.uid or "") .. ".ics"
+end
+
+--- Puts one event to the server (method PUT), or takes one away (DELETE).
+-- True when it worked, or nil and why. A DELETE that answers 404 counts
+-- (the event is gone either way). No If-Match: the last change wins.
+function Caldav:sendEvent(method, event, stamp)
+    local url = self:eventUrl(event)
+    if not url then return nil, "No calendar address is set" end
+    if method == "PUT" and not ((event.allDay and event.day) or event.starts) then
+        return nil, "The event has no time"
+    end
+    local headers, body = {}, nil
+    if method == "PUT" then
+        headers["Content-Type"] = "text/calendar; charset=utf-8"
+        body = Caldav.buildIcs(event, stamp)
+    end
+    local auth = self:authHeader()
+    if auth then headers.Authorization = auth end
+    local status = self.request(method, url, headers, body)
+    if type(status) ~= "number" then return nil, "No connection: " .. tostring(status) end
+    if method == "DELETE" and status == 404 then return true end
+    if status < 200 or status >= 300 then return nil, "HTTP " .. tostring(status) end
+    return true
+end
+
+--- Sends a queue of changes ({ kind = "put" or "delete", event = ... }) in
+-- order, stopping at the first one that fails: the rest stays queued.
+-- Returns { sent = how many went, stopped = why (when one failed) }.
+function Caldav:pushQueue(queue, stamp)
+    local report = { sent = 0 }
+    for __, op in ipairs(queue or {}) do
+        local ok, why = self:sendEvent(op.kind == "delete" and "DELETE" or "PUT", op.event or {}, stamp)
+        if not ok then
+            report.stopped = why
+            break
+        end
+        report.sent = report.sent + 1
+    end
+    return report
+end
+
+-- The queue's key for an event: its UID, or its address when it has none.
+local function eventKey(ev)
+    if ev.uid and ev.uid ~= "" then return "u:" .. ev.uid end
+    if ev.href and ev.href ~= "" then return "h:" .. ev.href end
+end
+
+local function copy(v)
+    if type(v) ~= "table" then return v end
+    local out = {}
+    for k, x in pairs(v) do out[k] = copy(x) end
+    return out
+end
+
+--- Puts `event` into `events` in place: replaces the one with its UID (or
+-- address), or is added.
+function Caldav.applyEvent(events, event)
+    local key = eventKey(event)
+    for i, ev in ipairs(events) do
+        if key and eventKey(ev) == key then
+            events[i] = copy(event)
+            return
+        end
+    end
+    table.insert(events, copy(event))
+end
+
+--- Takes the event with `event`'s UID (or address) out of `events`, in place.
+function Caldav.removeEvent(events, event)
+    local key = eventKey(event)
+    for i, ev in ipairs(events) do
+        if key and eventKey(ev) == key then
+            table.remove(events, i)
+            return
+        end
+    end
+end
+
+--- The events to show: the fetched ones with a queue of changes on top
+-- ({ kind = "put" or "delete", event = ... }), each in place, newest last.
+-- A fresh list; the ones passed in are left as they are.
+function Caldav.applyQueue(events, queue)
+    local out = {}
+    for __, ev in ipairs(events or {}) do table.insert(out, copy(ev)) end
+    for __, op in ipairs(queue or {}) do
+        if op.kind == "delete" then Caldav.removeEvent(out, op.event or {})
+        else Caldav.applyEvent(out, op.event or {}) end
+    end
+    return out
+end
+
 -- ------------------------------------------------------------------ fetching
 
 -- A moment as iCal writes it (UTC).
@@ -317,24 +482,52 @@ function Caldav.queryBody(from, until_)
         .. "</C:calendar-query>"
 end
 
--- The iCal bodies inside a REPORT's answer (<…:calendar-data>…</…:calendar-data>).
+-- The iCal body inside one answer's <…:calendar-data>…</…:calendar-data>.
 local ENTITIES = { ["&lt;"] = "<", ["&gt;"] = ">", ["&quot;"] = "\"", ["&apos;"] = "'", ["&amp;"] = "&" }
 
-function Caldav.extractCalendarData(xml)
+local function calendarDataOf(block)
+    local chunk = block:match("<[%w%-]*:?[cC]alendar%-data[^>]*>(.-)</[%w%-]*:?[cC]alendar%-data%s*>")
+    if not chunk then return nil end
+    chunk = chunk:match("<!%[CDATA%[(.-)%]%]>") or chunk
+    return (chunk:gsub("&[%w]+;", ENTITIES))
+end
+
+--- The parts of a REPORT's answer: { { ics, href, etag } } for each response
+-- that carries a calendar (the address and the etag as the server wrote them,
+-- escapes off; the event's own address `href` is what a PUT or DELETE goes to).
+-- An answer with calendars but no responses (not a proper 207) is one part.
+function Caldav.responsesOf(xml)
     local out = {}
     if type(xml) ~= "string" then return out end
-    for chunk in xml:gmatch("<[%w%-]*:?[cC]alendar%-data[^>]*>(.-)</[%w%-]*:?[cC]alendar%-data%s*>") do
-        chunk = chunk:match("<!%[CDATA%[(.-)%]%]>") or chunk
-        chunk = chunk:gsub("&[%w]+;", ENTITIES)
-        table.insert(out, chunk)
+    local function prop(block, name)
+        return (block:match("<[%w%-]*:?" .. name .. "[^>]*>(.-)</[%w%-]*:?" .. name .. "%s*>") or "")
+            :gsub("&[%w]+;", ENTITIES)
     end
+    for block in xml:gmatch("<[%w%-]*:?[rR]esponse[%s>].-</[%w%-]*:?[rR]esponse%s*>") do
+        local ics = calendarDataOf(block)
+        if ics then table.insert(out, { ics = ics, href = prop(block, "href"), etag = prop(block, "getetag") }) end
+    end
+    if #out == 0 then
+        for chunk in xml:gmatch("<[%w%-]*:?[cC]alendar%-data[^>]*>(.-)</[%w%-]*:?[cC]alendar%-data%s*>") do
+            chunk = chunk:match("<!%[CDATA%[(.-)%]%]>") or chunk
+            table.insert(out, { ics = (chunk:gsub("&[%w]+;", ENTITIES)) })
+        end
+    end
+    return out
+end
+
+--- The iCal bodies inside a REPORT's answer.
+function Caldav.extractCalendarData(xml)
+    local out = {}
+    for __, r in ipairs(Caldav.responsesOf(xml)) do table.insert(out, r.ics) end
     return out
 end
 
 --- The events between `from` and `until_` (Unix seconds; nil: the server's
 -- whole calendar). A GET of the calendar's address first; when the answer
--- isn't a calendar, a REPORT calendar-query asks the collection. Returns the
--- events, or nil and why.
+-- isn't a calendar, a REPORT calendar-query asks the collection. Each event
+-- keeps the server's address for it (`href`) when the REPORT gave one. Returns
+-- the events, or nil and why.
 function Caldav:fetch(from, until_, offset)
     local url = self:calendarUrl()
     if not url then return nil, "No calendar address is set" end
@@ -350,8 +543,11 @@ function Caldav:fetch(from, until_, offset)
     if type(status) ~= "number" then return nil, "No connection: " .. tostring(status) end
     if status == 207 and type(body) == "string" then
         local events = {}
-        for __, ics in ipairs(Caldav.extractCalendarData(body)) do
-            for __, event in ipairs(Caldav.parseIcs(ics, offset)) do table.insert(events, event) end
+        for __, r in ipairs(Caldav.responsesOf(body)) do
+            for __, event in ipairs(Caldav.parseIcs(r.ics, offset)) do
+                if r.href ~= "" then event.href = r.href end
+                table.insert(events, event)
+            end
         end
         return events
     end
